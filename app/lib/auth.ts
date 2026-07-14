@@ -95,6 +95,7 @@ export const {
   signOut
 } = NextAuth(() => ({
   secret: process.env.AUTH_SECRET,
+  trustHost: true,
   adapter: DrizzleAdapter(createDb(), {
     usersTable: users,
     accountsTable: accounts,
