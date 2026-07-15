@@ -3,6 +3,7 @@ import { auth } from "@/lib/auth"
 import { redirect } from "next/navigation"
 import type { Locale } from "@/i18n/config"
 import { getTurnstileConfig } from "@/lib/turnstile"
+import { getRequestContext } from "@cloudflare/next-on-pages"
 
 export const runtime = "edge"
 
@@ -20,10 +21,18 @@ export default async function LoginPage({
   }
 
   const turnstile = await getTurnstileConfig()
+  const env = getRequestContext().env
+  const oauthProviders = {
+    github: Boolean(env.AUTH_GITHUB_ID && env.AUTH_GITHUB_SECRET),
+    google: Boolean(env.AUTH_GOOGLE_ID && env.AUTH_GOOGLE_SECRET),
+  }
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-b from-gray-50 to-gray-100 dark:from-gray-900 dark:to-gray-800">
-      <LoginForm turnstile={{ enabled: turnstile.enabled, siteKey: turnstile.siteKey }} />
+      <LoginForm
+        turnstile={{ enabled: turnstile.enabled, siteKey: turnstile.siteKey }}
+        oauthProviders={oauthProviders}
+      />
     </div>
   )
 }

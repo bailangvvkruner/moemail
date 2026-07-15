@@ -30,10 +30,21 @@ export async function POST(request: Request) {
 
     const user = await register(username, password)
 
-    return NextResponse.json({ user })
+    return NextResponse.json({
+      user: {
+        id: user.id,
+        username: user.username,
+      },
+    })
   } catch (error) {
+    const message = error instanceof Error ? error.message : ""
+    if (message === "用户名已存在" || /UNIQUE constraint failed: user\.username/i.test(message)) {
+      return NextResponse.json({ error: "用户名已存在" }, { status: 409 })
+    }
+
+    console.error("Registration failed", error)
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "注册失败" },
+      { error: "注册失败" },
       { status: 500 }
     )
   }

@@ -4,11 +4,11 @@ import Google from "next-auth/providers/google"
 import { DrizzleAdapter } from "@auth/drizzle-adapter"
 import { createDb, Db } from "./db"
 import { accounts, users, roles, userRoles } from "./schema"
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { getRequestContext } from "@cloudflare/next-on-pages"
 import { Permission, hasPermission, ROLES, Role } from "./permissions"
 import CredentialsProvider from "next-auth/providers/credentials"
-import { hashPassword, comparePassword } from "@/lib/utils"
+import { hashPassword, verifyPassword } from "@/lib/password"
 import { authSchema, AuthSchema } from "@/lib/validation"
 import { generateAvatarUrl } from "./avatar"
 import { getUserId } from "./apiKey"
@@ -93,24 +93,32 @@ export const {
   auth,
   signIn,
   signOut
-} = NextAuth(() => ({
-  secret: process.env.AUTH_SECRET,
+} = NextAuth(() => {
+  const env = getRequestContext().env
+  const authSecret = env.AUTH_SECRET || process.env.AUTH_SECRET
+  const githubId = env.AUTH_GITHUB_ID || process.env.AUTH_GITHUB_ID
+  const githubSecret = env.AUTH_GITHUB_SECRET || process.env.AUTH_GITHUB_SECRET
+  const googleId = env.AUTH_GOOGLE_ID || process.env.AUTH_GOOGLE_ID
+  const googleSecret = env.AUTH_GOOGLE_SECRET || process.env.AUTH_GOOGLE_SECRET
+
+  return {
+  secret: authSecret,
   trustHost: true,
   adapter: DrizzleAdapter(createDb(), {
     usersTable: users,
     accountsTable: accounts,
   }),
   providers: [
-    GitHub({
-      clientId: process.env.AUTH_GITHUB_ID,
-      clientSecret: process.env.AUTH_GITHUB_SECRET,
+    ...(githubId && githubSecret ? [GitHub({
+      clientId: githubId,
+      clientSecret: githubSecret,
       allowDangerousEmailAccountLinking: true,
-    }),
-    Google({
-      clientId: process.env.AUTH_GOOGLE_ID,
-      clientSecret: process.env.AUTH_GOOGLE_SECRET,
+    })] : []),
+    ...(googleId && googleSecret ? [Google({
+      clientId: googleId,
+      clientSecret: googleSecret,
       allowDangerousEmailAccountLinking: true,
-    }),
+    })] : []),
     CredentialsProvider({
       name: "Credentials",
       credentials: {
@@ -119,7 +127,7 @@ export const {
       },
       async authorize(credentials) {
         if (!credentials) {
-          throw new Error("请输入用户名和密码")
+          return null
         }
 
         const { username, password, turnstileToken } = credentials as Record<string, string | undefined>
@@ -129,15 +137,12 @@ export const {
           parsedCredentials = authSchema.parse({ username, password, turnstileToken })
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
         } catch (error) {
-          throw new Error("输入格式不正确")
+          return null
         }
 
         const verification = await verifyTurnstileToken(parsedCredentials.turnstileToken)
         if (!verification.success) {
-          if (verification.reason === "missing-token") {
-            throw new Error("请先完成安全验证")
-          }
-          throw new Error("安全验证未通过")
+          return null
         }
 
         const db = createDb()
@@ -146,13 +151,29 @@ export const {
           where: eq(users.username, parsedCredentials.username),
         })
 
-        if (!user) {
-          throw new Error("用户名或密码错误")
+        if (!user?.password) {
+          return null
         }
 
-        const isValid = await comparePassword(parsedCredentials.password, user.password as string)
-        if (!isValid) {
-          throw new Error("用户名或密码错误")
+        const legacySecrets = [...new Set([authSecret, env.AUTH_LEGACY_PASSWORD_SECRET, ""]
+          .filter((value): value is string => value !== undefined))]
+        const verificationResult = await verifyPassword(
+          parsedCredentials.password,
+          user.password,
+          { legacySecrets },
+        )
+        if (!verificationResult.valid) {
+          return null
+        }
+
+        if (verificationResult.needsRehash) {
+          try {
+            await db.update(users)
+              .set({ password: await hashPassword(parsedCredentials.password) })
+              .where(and(eq(users.id, user.id), eq(users.password, user.password)))
+          } catch (error) {
+            console.error("Password hash upgrade failed", { userId: user.id, error })
+          }
         }
 
         return {
@@ -234,7 +255,8 @@ export const {
   session: {
     strategy: "jwt",
   },
-}))
+  }
+})
 
 export async function register(username: string, password: string) {
   const db = createDb()
