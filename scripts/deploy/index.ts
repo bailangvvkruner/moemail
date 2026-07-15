@@ -299,7 +299,7 @@ const syncAccountDomains = async (namespaceId: string) => {
   } while (page <= totalPages);
 
   const domains = [...new Set(zones
-    .filter(zone => zone.status === "active")
+    .filter(zone => zone.status === "active" && !zone.name.toLowerCase().endsWith(".arpa"))
     .map(zone => zone.name.trim().toLowerCase())
     .filter(Boolean))]
     .sort((left, right) => left.localeCompare(right));
