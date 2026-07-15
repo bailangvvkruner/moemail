@@ -17,6 +17,19 @@ const DATABASE_NAME = process.env.DATABASE_NAME || "moemail-db";
 const KV_NAMESPACE_NAME = process.env.KV_NAMESPACE_NAME || "moemail-kv";
 const CUSTOM_DOMAIN = process.env.CUSTOM_DOMAIN;
 const KV_NAMESPACE_ID = process.env.KV_NAMESPACE_ID;
+const SYNC_ACCOUNT_DOMAINS = process.env.SYNC_ACCOUNT_DOMAINS === "true";
+
+interface CloudflareApiResponse<T> {
+  success: boolean;
+  result: T;
+  errors?: Array<{ message?: string }>;
+  result_info?: { total_pages?: number };
+}
+
+interface CloudflareZone {
+  name: string;
+  status: string;
+}
 
 /**
  * 验证必要的环境变量
@@ -216,13 +229,13 @@ const migrateDatabase = () => {
 /**
  * 检查并创建KV命名空间
  */
-const checkAndCreateKVNamespace = async () => {
+const checkAndCreateKVNamespace = async (): Promise<string> => {
   console.log(`🔍 Checking if KV namespace "${KV_NAMESPACE_NAME}" exists...`);
 
   if (KV_NAMESPACE_ID) {
     updateKVConfig(KV_NAMESPACE_ID);
     console.log(`✅ User specified KV namespace (ID: ${KV_NAMESPACE_ID})`);
-    return;
+    return KV_NAMESPACE_ID;
   }
 
   try {
@@ -234,16 +247,83 @@ const checkAndCreateKVNamespace = async () => {
     if (namespace && namespace.id) {
       updateKVConfig(namespace.id);
       console.log(`✅ KV namespace "${KV_NAMESPACE_NAME}" found by name (ID: ${namespace.id})`);
+      return namespace.id;
     } else {
       console.log("⚠️ KV namespace not found by name, creating new KV namespace...");
       namespace = await createKVNamespace();
+      if (!namespace.id) {
+        throw new Error("Created KV namespace is missing an ID");
+      }
       updateKVConfig(namespace.id);
       console.log(`✅ KV namespace "${KV_NAMESPACE_NAME}" created successfully (ID: ${namespace.id})`);
+      return namespace.id;
     }
   } catch (error) {
     console.error(`❌ An error occurred while checking the KV namespace:`, error);
     throw error;
   }
+};
+
+/**
+ * 将账户下所有活动 Zone 同步为可选邮箱域名。
+ */
+const syncAccountDomains = async (namespaceId: string) => {
+  if (!SYNC_ACCOUNT_DOMAINS) return;
+
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID!;
+  const apiToken = process.env.CLOUDFLARE_API_TOKEN!;
+  const headers = { Authorization: `Bearer ${apiToken}` };
+  const zones: CloudflareZone[] = [];
+  let page = 1;
+  let totalPages = 1;
+
+  console.log("🌐 Syncing active Cloudflare zones to EMAIL_DOMAINS...");
+
+  do {
+    const url = new URL("https://api.cloudflare.com/client/v4/zones");
+    url.searchParams.set("account.id", accountId);
+    url.searchParams.set("status", "active");
+    url.searchParams.set("per_page", "50");
+    url.searchParams.set("page", page.toString());
+
+    const response = await fetch(url, { headers });
+    const data = await response.json() as CloudflareApiResponse<CloudflareZone[]>;
+    if (!response.ok || !data.success) {
+      const message = data.errors?.map(error => error.message).filter(Boolean).join("; ");
+      throw new Error(`Failed to list Cloudflare zones: ${message || response.statusText}`);
+    }
+
+    zones.push(...data.result);
+    totalPages = Math.max(data.result_info?.total_pages ?? 1, 1);
+    page += 1;
+  } while (page <= totalPages);
+
+  const domains = [...new Set(zones
+    .filter(zone => zone.status === "active")
+    .map(zone => zone.name.trim().toLowerCase())
+    .filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right));
+
+  if (domains.length === 0) {
+    throw new Error("No active Cloudflare zones were found for this account");
+  }
+
+  const kvUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values/EMAIL_DOMAINS`;
+  const updateResponse = await fetch(kvUrl, {
+    method: "PUT",
+    headers: {
+      ...headers,
+      "Content-Type": "text/plain; charset=utf-8",
+    },
+    body: domains.join(","),
+  });
+  const updateData = await updateResponse.json() as CloudflareApiResponse<null>;
+  if (!updateResponse.ok || !updateData.success) {
+    const message = updateData.errors?.map(error => error.message).filter(Boolean).join("; ");
+    throw new Error(`Failed to update EMAIL_DOMAINS: ${message || updateResponse.statusText}`);
+  }
+
+  console.log(`✅ Synced ${domains.length} email domains: ${domains.join(", ")}`);
 };
 
 /**
@@ -486,7 +566,8 @@ const main = async () => {
     setupWranglerConfigs();
     await checkAndCreateDatabase();
     migrateDatabase();
-    await checkAndCreateKVNamespace();
+    const namespaceId = await checkAndCreateKVNamespace();
+    await syncAccountDomains(namespaceId);
     await checkAndCreatePages();
     pushPagesSecret();
     deployPages();
